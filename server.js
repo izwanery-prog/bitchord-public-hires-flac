@@ -3,7 +3,7 @@ import http from 'node:http';
 import { URL } from 'node:url';
 
 const PORT = Number(process.env.PORT || 8080);
-const USER_AGENT = 'BitChord-Public-HiRes-FLAC/2.1.0';
+const USER_AGENT = 'BitChord-Public-HiRes-FLAC/2.2.0';
 const SEARCH_LIMIT = Math.min(
   Math.max(Number(process.env.SEARCH_LIMIT || 12), 1),
   25
@@ -16,8 +16,8 @@ const itemCache = new Map();
 const manifest = {
   id: 'com.ery.bitchord.public-hires-flac',
   name: 'Public Hi-Res FLAC',
-  version: '2.1.0',
-  description: 'Publicly licensed FLAC recordings with verified 24-bit and Hi-Res audio support.',
+  version: '2.2.0',
+  description: 'Verified public-domain and Creative Commons FLAC recordings with automatic Hi-Res fallback.',
   resources: ['search', 'stream'],
   allowDownloads: 1,
   checkValidLossless: 0,
@@ -27,22 +27,10 @@ const manifest = {
     label: 'Audio quality',
     default: '24bit',
     options: [
-      {
-        value: 'hires',
-        label: 'Strict Hi-Res (24-bit / 96–192 kHz)'
-      },
-      {
-        value: '24bit',
-        label: '24-bit FLAC (44.1–192 kHz)'
-      },
-      {
-        value: 'lossless',
-        label: 'Lossless FLAC (any resolution)'
-      },
-      {
-        value: 'high',
-        label: 'High (fallback to next BitChord source)'
-      }
+      { value: 'hires', label: 'Hi-Res First (automatic 24-bit fallback)' },
+      { value: '24bit', label: '24-bit FLAC (44.1–192 kHz)' },
+      { value: 'lossless', label: 'Lossless FLAC (any resolution)' },
+      { value: 'high', label: 'High (fallback to next BitChord source)' }
     ]
   }]
 };
@@ -109,12 +97,10 @@ function pickFlacFiles(meta) {
 }
 
 function niceTitle(fileName, fallback) {
-  const base = fileName
+  return fileName
     .split('/')
     .pop()
-    .replace(/\.flac$/i, '');
-
-  return base
+    .replace(/\.flac$/i, '')
     .replace(/[_]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim() || fallback || 'Untitled recording';
@@ -181,10 +167,6 @@ async function readFirstBytes(response, wanted = 64) {
   return Buffer.concat(chunks).subarray(0, wanted);
 }
 
-/*
- * Verify FLAC STREAMINFO.
- * Reads the actual file header, not just the filename.
- */
 async function flacInfo(url) {
   try {
     const response = await fetch(url, {
@@ -234,10 +216,7 @@ async function flacInfo(url) {
       return {};
     }
 
-    return {
-      sampleRate,
-      bitDepth
-    };
+    return { sampleRate, bitDepth };
 
   } catch {
     return {};
@@ -267,6 +246,14 @@ function isVerifiedLossless(info) {
   );
 }
 
+function qualityAllowed(info, quality) {
+  if (quality === 'hires') return isStrictHiRes(info);
+  if (quality === '24bit') return is24Bit(info);
+  if (quality === 'lossless') return isVerifiedLossless(info);
+
+  return false;
+}
+
 function resolutionLabel(info) {
   if (!isVerifiedLossless(info)) {
     return 'FLAC · resolution not verified';
@@ -281,35 +268,79 @@ function resolutionLabel(info) {
   return `FLAC · ${info.bitDepth}-bit / ${rate} kHz`;
 }
 
-/*
- * Higher bit depth and sample rate are prioritised.
- */
 function qualityRank(info) {
-  return (
-    info.bitDepth * 1000000 +
-    info.sampleRate
-  );
-}
-
-function qualityAllowed(info, quality) {
-  if (quality === 'hires') {
-    return isStrictHiRes(info);
-  }
-
-  if (quality === '24bit') {
-    return is24Bit(info);
-  }
-
-  if (quality === 'lossless') {
-    return isVerifiedLossless(info);
-  }
-
-  return false;
+  return info.bitDepth * 1000000 + info.sampleRate;
 }
 
 /*
- * Search Internet Archive.
- * Verify FLAC files before returning tracks.
+ * Search and verify recordings.
+ */
+async function collectTracks(docs, quality) {
+  const candidates = [];
+  const seen = new Set();
+
+  const maxCandidates = SEARCH_LIMIT * 3;
+
+  for (const doc of docs) {
+    if (candidates.length >= maxCandidates) break;
+
+    try {
+      const item = await getItem(doc.identifier);
+
+      if (!item.permitted) continue;
+
+      for (const file of item.files) {
+        if (candidates.length >= maxCandidates) break;
+
+        const id = `${doc.identifier}::${file.name}`;
+
+        if (seen.has(id)) continue;
+        seen.add(id);
+
+        const direct = makeDirectUrl(
+          doc.identifier,
+          file.name
+        );
+
+        const info = await flacInfo(direct);
+
+        if (!qualityAllowed(info, quality)) continue;
+
+        candidates.push({
+          id,
+          title: niceTitle(file.name, doc.title),
+          artist: Array.isArray(doc.creator)
+            ? doc.creator.join(', ')
+            : (doc.creator || 'Internet Archive contributor'),
+          album: doc.title || doc.identifier,
+          artworkURL:
+            `https://archive.org/services/img/${encodeURIComponent(doc.identifier)}`,
+          format: 'flac',
+          audioQuality: 'LOSSLESS',
+          sampleRate: info.sampleRate,
+          bitDepth: info.bitDepth,
+          qualityLabel: resolutionLabel(info),
+          rank: qualityRank(info)
+        });
+
+      }
+    } catch (error) {
+      console.error(
+        `Skipping ${doc.identifier}:`,
+        error.message
+      );
+    }
+  }
+
+  candidates.sort((a, b) => b.rank - a.rank);
+
+  return candidates
+    .slice(0, SEARCH_LIMIT)
+    .map(({ rank, ...track }) => track);
+}
+
+/*
+ * Hi-Res search with automatic 24-bit fallback.
  */
 async function searchTracks(query, quality) {
   const key = `${query.toLowerCase()}|${quality}`;
@@ -324,13 +355,9 @@ async function searchTracks(query, quality) {
     .replace(/["\\]/g, ' ')
     .trim();
 
-  const words = safeQuery
-    .split(/\s+/)
-    .filter(Boolean);
+  const words = safeQuery.split(/\s+/).filter(Boolean);
 
-  if (!words.length) {
-    return { tracks: [] };
-  }
+  if (!words.length) return { tracks: [] };
 
   const q =
     `mediatype:audio AND (` +
@@ -352,72 +379,36 @@ async function searchTracks(query, quality) {
 
   const docs = data.response?.docs || [];
 
-  const candidates = [];
-  const seen = new Set();
+  let tracks = [];
+  let fallbackUsed = false;
 
-  const maxCandidates = SEARCH_LIMIT * 3;
+  if (quality === 'hires') {
+    // First priority: genuine Hi-Res.
+    tracks = await collectTracks(docs, 'hires');
 
-  for (const doc of docs) {
-    if (candidates.length >= maxCandidates) break;
+    // Second priority: verified 24-bit FLAC.
+    if (tracks.length === 0) {
+      tracks = await collectTracks(docs, '24bit');
 
-    try {
-      const item = await getItem(doc.identifier);
+      if (tracks.length > 0) {
+        fallbackUsed = true;
 
-      if (!item.permitted) continue;
-
-      for (const file of item.files) {
-        if (candidates.length >= maxCandidates) break;
-
-        const id = `${doc.identifier}::${file.name}`;
-
-        if (seen.has(id)) continue;
-
-        seen.add(id);
-
-        const direct = makeDirectUrl(
-          doc.identifier,
-          file.name
-        );
-
-        const info = await flacInfo(direct);
-
-        if (!qualityAllowed(info, quality)) {
-          continue;
-        }
-
-        candidates.push({
-          id,
-          title: niceTitle(file.name, doc.title),
-          artist: Array.isArray(doc.creator)
-            ? doc.creator.join(', ')
-            : (doc.creator || 'Internet Archive contributor'),
-          album: doc.title || doc.identifier,
-          artworkURL:
-            `https://archive.org/services/img/${encodeURIComponent(doc.identifier)}`,
-          format: 'flac',
-          audioQuality: 'LOSSLESS',
-          sampleRate: info.sampleRate,
-          bitDepth: info.bitDepth,
-          qualityLabel: resolutionLabel(info),
-          rank: qualityRank(info)
-        });
+        tracks = tracks.map(track => ({
+          ...track,
+          fallback: true,
+          qualityLabel: `${track.qualityLabel} · Hi-Res unavailable`
+        }));
       }
-
-    } catch (error) {
-      console.error(
-        `Skipping archive item ${doc.identifier}:`,
-        error.message
-      );
     }
+
+  } else {
+    tracks = await collectTracks(docs, quality);
   }
 
-  candidates.sort((a, b) => b.rank - a.rank);
-
-  const tracks = candidates
-    .slice(0, SEARCH_LIMIT)
-    .map(({ rank, ...track }) => track);
-
-  const result = { tracks };
+  const result = {
+    tracks,
+    fallbackUsed
+  };
 
   searchCache.set(key, {
     at: Date.now(),
@@ -447,14 +438,12 @@ function decodeTrackId(raw) {
     return null;
   }
 
-  return {
-    identifier,
-    filename
-  };
+  return { identifier, filename };
 }
 
 /*
- * Verify the requested track again before streaming.
+ * Streaming verification.
+ * Hi-Res mode permits verified 24-bit fallback tracks.
  */
 async function streamInfo(rawId, quality) {
   const parsed = decodeTrackId(rawId);
@@ -478,14 +467,23 @@ async function streamInfo(rawId, quality) {
 
   const info = await flacInfo(direct);
 
-  if (!qualityAllowed(info, quality)) {
-    return null;
+  let allowed = qualityAllowed(info, quality);
+
+  // Permit genuine 24-bit fallback in Hi-Res mode.
+  if (quality === 'hires' && is24Bit(info)) {
+    allowed = true;
   }
+
+  if (!allowed) return null;
+
+  const isFallback =
+    quality === 'hires' && !isStrictHiRes(info);
 
   return {
     url: direct,
     format: 'flac',
     quality: resolutionLabel(info),
+    fallbackUsed: isFallback,
     codec: 'flac',
     container: 'flac',
     manifest: 'none',
@@ -527,9 +525,6 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
-    /*
-     * Manifest
-     */
     if (
       url.pathname === '/' ||
       url.pathname === '/manifest.json'
@@ -537,9 +532,6 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, manifest);
     }
 
-    /*
-     * Health check
-     */
     if (url.pathname === '/health') {
       return send(res, 200, {
         ok: true,
@@ -548,9 +540,6 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    /*
-     * Search
-     */
     if (url.pathname === '/search') {
       const query = (
         url.searchParams.get('q') || ''
@@ -564,9 +553,6 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { tracks: [] });
       }
 
-      /*
-       * Let BitChord use its next source.
-       */
       if (quality === 'high') {
         return send(res, 200, { tracks: [] });
       }
@@ -577,17 +563,13 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      const result = await searchTracks(
-        query,
-        quality
+      return send(
+        res,
+        200,
+        await searchTracks(query, quality)
       );
-
-      return send(res, 200, result);
     }
 
-    /*
-     * Stream information
-     */
     if (url.pathname.startsWith('/stream/')) {
       let rawId;
 
@@ -611,10 +593,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      const info = await streamInfo(
-        rawId,
-        quality
-      );
+      const info = await streamInfo(rawId, quality);
 
       return info
         ? send(res, 200, info)
@@ -638,6 +617,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(
-    `BitChord Public Hi-Res FLAC v2.1.0 listening on ${PORT}`
+    `BitChord Public Hi-Res FLAC v2.2.0 listening on ${PORT}`
   );
 });
