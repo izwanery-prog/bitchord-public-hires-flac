@@ -1,0 +1,9 @@
+{
+  "name": "bitchord-hires-public-addon",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BitChord 1.9.1 addon for openly licensed Internet Archive FLAC recordings",
+  "type": "module",
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": ">=20"}
+}
