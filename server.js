@@ -1,9 +1,9 @@
-
 import http from 'node:http';
 import { URL } from 'node:url';
 
 const PORT = Number(process.env.PORT || 8080);
-const USER_AGENT = 'BitChord-Public-HiRes-FLAC/2.3.0';
+const VERSION = '2.4.0';
+const USER_AGENT = `BitChord-MultiSource-Music/${VERSION}`;
 
 const SEARCH_LIMIT = Math.min(
   Math.max(Number(process.env.SEARCH_LIMIT || 12), 1),
@@ -15,14 +15,19 @@ const MAX_DOCS = 250;
 const MAX_CANDIDATES = 350;
 const VERIFY_CONCURRENCY = 8;
 
+const AUDIUS_BASES = [
+  'https://api.audius.co/v1',
+  'https://discoveryprovider.audius.co/v1'
+];
+
 const searchCache = new Map();
 const itemCache = new Map();
 
 const manifest = {
   id: 'com.ery.bitchord.public-hires-flac',
-  name: 'Public Hi-Res FLAC',
-  version: '2.3.0',
-  description: 'Expanded Internet Archive discovery with verified FLAC resolution and automatic 24-bit fallback.',
+  name: 'BitChord Multi-Source Music',
+  version: VERSION,
+  description: 'Modern Audius music streaming plus verified Internet Archive FLAC recordings.',
   resources: ['search', 'stream'],
   allowDownloads: 1,
   checkValidLossless: 0,
@@ -30,11 +35,15 @@ const manifest = {
     key: 'quality',
     type: 'select',
     label: 'Audio quality',
-    default: '24bit',
+    default: 'best',
     options: [
       {
+        value: 'best',
+        label: 'Best Available (Audius + FLAC)'
+      },
+      {
         value: 'hires',
-        label: 'Hi-Res First (automatic 24-bit fallback)'
+        label: 'Hi-Res FLAC First (automatic 24-bit fallback)'
       },
       {
         value: '24bit',
@@ -66,10 +75,10 @@ function send(res, status, data, headers = {}) {
   res.end(body);
 }
 
-async function getJson(url) {
+async function getJson(url, timeout = 20000) {
   const response = await fetch(url, {
     headers: { 'User-Agent': USER_AGENT },
-    signal: AbortSignal.timeout(20000)
+    signal: AbortSignal.timeout(timeout)
   });
 
   if (!response.ok) {
@@ -299,9 +308,6 @@ function cleanSearchWords(query) {
     .slice(0, 8);
 }
 
-/*
- * Search multiple catalogue fields and query variations.
- */
 function buildSearchQueries(words) {
   const phrase = words.join(' ');
   const fields = ['title', 'creator', 'subject', 'description'];
@@ -319,8 +325,6 @@ function buildSearchQueries(words) {
     `mediatype:audio AND (${allWordParts.join(' OR ')})`
   ];
 
-  // For multi-word searches, also search each important word.
-  // This helps discover albums filed under slightly different titles.
   if (words.length > 1) {
     for (const word of words.slice(0, 3)) {
       queries.push(
@@ -363,7 +367,7 @@ async function discoverDocuments(words) {
 
   for (const batch of batches) {
     if (batch.status !== 'fulfilled') {
-      console.error('One catalogue search failed:', batch.reason?.message);
+      console.error('One Internet Archive search failed:', batch.reason?.message);
       continue;
     }
 
@@ -382,9 +386,6 @@ async function discoverDocuments(words) {
   return docs;
 }
 
-/*
- * Run asynchronous work with a controlled number of workers.
- */
 async function mapLimit(items, limit, worker) {
   const results = new Array(items.length);
   let next = 0;
@@ -397,7 +398,7 @@ async function mapLimit(items, limit, worker) {
 
       try {
         results[index] = await worker(items[index], index);
-      } catch (error) {
+      } catch {
         results[index] = null;
       }
     }
@@ -413,9 +414,6 @@ async function mapLimit(items, limit, worker) {
   return results;
 }
 
-/*
- * Load permitted items and verify their actual FLAC headers.
- */
 async function collectTracks(docs, quality) {
   const candidates = [];
   const seen = new Set();
@@ -457,10 +455,7 @@ async function collectTracks(docs, quality) {
 
       return {
         id: candidate.id,
-        title: niceTitle(
-          candidate.file.name,
-          doc.title
-        ),
+        title: niceTitle(candidate.file.name, doc.title),
         artist: Array.isArray(doc.creator)
           ? doc.creator.join(', ')
           : (doc.creator || 'Internet Archive contributor'),
@@ -472,6 +467,8 @@ async function collectTracks(docs, quality) {
         sampleRate: info.sampleRate,
         bitDepth: info.bitDepth,
         qualityLabel: resolutionLabel(info),
+        source: 'Internet Archive',
+        sourceId: doc.identifier,
         rank: qualityRank(info)
       };
     }
@@ -489,19 +486,132 @@ async function collectTracks(docs, quality) {
     }
   }
 
-  return [...unique.values()]
-    .sort((a, b) => b.rank - a.rank)
-    .slice(0, SEARCH_LIMIT)
-    .map(({ rank, ...track }) => track);
+  // Prevent one Internet Archive collection from filling the entire result list.
+  const collectionCounts = new Map();
+  const selected = [];
+
+  for (const track of [...unique.values()].sort((a, b) => b.rank - a.rank)) {
+    const count = collectionCounts.get(track.sourceId) || 0;
+
+    if (count >= 3) continue;
+
+    collectionCounts.set(track.sourceId, count + 1);
+    selected.push(track);
+
+    if (selected.length >= SEARCH_LIMIT) break;
+  }
+
+  return selected.map(({ rank, ...track }) => track);
 }
 
-/*
- * Search priority:
- * 1. Genuine 24-bit Hi-Res (96–192 kHz)
- * 2. Verified 24-bit FLAC fallback
- *
- * The separate lossless setting also supports 16-bit FLAC.
- */
+function audiusArtwork(track) {
+  const artwork = track.artwork;
+
+  if (typeof artwork === 'string') return artwork;
+  if (artwork && typeof artwork === 'object') {
+    return artwork['480x480'] ||
+      artwork['1000x1000'] ||
+      artwork['150x150'] ||
+      Object.values(artwork)[0] ||
+      null;
+  }
+
+  return null;
+}
+
+function normaliseText(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+function dedupeKey(track) {
+  return `${normaliseText(track.artist)}|${normaliseText(track.title)}`;
+}
+
+function audiusReleaseDate(track) {
+  return track.release_date ||
+    track.created_at ||
+    track.updated_at ||
+    null;
+}
+
+function isPublicAudiusTrack(track) {
+  return (
+    track &&
+    track.id !== undefined &&
+    track.is_stream_gated !== true &&
+    track.is_delete !== true &&
+    track.is_unlisted !== true &&
+    track.is_available !== false
+  );
+}
+
+async function audiusSearch(query, limit = SEARCH_LIMIT) {
+  let lastError;
+
+  for (const base of AUDIUS_BASES) {
+    try {
+      const params = new URLSearchParams({
+        query,
+        limit: String(Math.min(Math.max(limit * 2, 12), 50)),
+        sort_method: 'recent'
+      });
+
+      const apiKey = process.env.AUDIUS_API_KEY;
+      if (apiKey) params.set('api_key', apiKey);
+
+      const data = await getJson(
+        `${base}/tracks/search?${params}`,
+        15000
+      );
+
+      const tracks = Array.isArray(data.data) ? data.data : [];
+
+      return tracks
+        .filter(isPublicAudiusTrack)
+        .map(track => {
+          const user = track.user || {};
+          const artist = user.name || user.handle || 'Audius artist';
+          const releaseDate = audiusReleaseDate(track);
+
+          return {
+            id: `audius::${track.id}`,
+            title: track.title || 'Untitled track',
+            artist,
+            album: track.album_name || 'Audius',
+            artworkURL: audiusArtwork(track),
+            format: 'mp3',
+            audioQuality: 'STREAMING',
+            sampleRate: 48000,
+            bitRate: 320000,
+            qualityLabel: 'Audius stream · MP3 320 kbps / 48 kHz',
+            source: 'Audius',
+            sourceId: String(track.id),
+            releaseDate,
+            duration: Number(track.duration || 0),
+            permalink: track.permalink || null,
+            rank: Number(track.play_count || 0)
+          };
+        })
+        .sort((a, b) => {
+          const dateA = Date.parse(a.releaseDate || '') || 0;
+          const dateB = Date.parse(b.releaseDate || '') || 0;
+          return dateB - dateA || b.rank - a.rank;
+        })
+        .slice(0, limit);
+
+    } catch (error) {
+      lastError = error;
+      console.error(`Audius endpoint failed (${base}):`, error.message);
+    }
+  }
+
+  throw lastError || new Error('Audius search unavailable');
+}
+
 async function searchTracks(query, quality) {
   const key = `${query.toLowerCase()}|${quality}`;
 
@@ -514,41 +624,105 @@ async function searchTracks(query, quality) {
   const words = cleanSearchWords(query);
 
   if (!words.length) {
-    return { tracks: [], fallbackUsed: false };
+    return {
+      tracks: [],
+      fallbackUsed: false,
+      sources: []
+    };
   }
 
-  const docs = await discoverDocuments(words);
+  let result;
 
-  let tracks = [];
-  let fallbackUsed = false;
+  if (quality === 'best') {
+    const [audiusResult, docsResult] = await Promise.allSettled([
+      audiusSearch(query, SEARCH_LIMIT),
+      discoverDocuments(words)
+    ]);
 
-  if (quality === 'hires') {
-    tracks = await collectTracks(docs, 'hires');
+    const audiusTracks = audiusResult.status === 'fulfilled'
+      ? audiusResult.value
+      : [];
 
-    if (tracks.length === 0) {
-      tracks = await collectTracks(docs, '24bit');
-
-      if (tracks.length > 0) {
-        fallbackUsed = true;
-
-        tracks = tracks.map(track => ({
-          ...track,
-          fallback: true,
-          qualityLabel:
-            `${track.qualityLabel} · Hi-Res unavailable`
-        }));
-      }
+    if (audiusResult.status === 'rejected') {
+      console.error('Audius search unavailable:', audiusResult.reason?.message);
     }
 
-  } else {
-    tracks = await collectTracks(docs, quality);
-  }
+    const docs = docsResult.status === 'fulfilled'
+      ? docsResult.value
+      : [];
 
-  const result = {
-    tracks,
-    fallbackUsed,
-    searchDocuments: docs.length
-  };
+    if (docsResult.status === 'rejected') {
+      console.error('Internet Archive discovery unavailable:', docsResult.reason?.message);
+    }
+
+    const archiveTracks = docs.length
+      ? await collectTracks(docs, 'lossless')
+      : [];
+
+    const combined = [];
+    const seen = new Set();
+
+    // Audius first so modern independent music is not buried by archive results.
+    for (const track of [...audiusTracks, ...archiveTracks]) {
+      const key = dedupeKey(track);
+
+      if (seen.has(key)) continue;
+
+      seen.add(key);
+      combined.push(track);
+
+      if (combined.length >= SEARCH_LIMIT) break;
+    }
+
+    result = {
+      tracks: combined,
+      fallbackUsed: false,
+      searchDocuments: docs.length,
+      sources: [
+        ...(audiusTracks.length ? ['Audius'] : []),
+        ...(archiveTracks.length ? ['Internet Archive'] : [])
+      ],
+      sourceErrors: {
+        audius: audiusResult.status === 'rejected',
+        internetArchive: docsResult.status === 'rejected'
+      }
+    };
+
+  } else {
+    const docs = await discoverDocuments(words);
+
+    let tracks = [];
+    let fallbackUsed = false;
+
+    if (quality === 'hires') {
+      tracks = await collectTracks(docs, 'hires');
+
+      if (tracks.length === 0) {
+        tracks = await collectTracks(docs, '24bit');
+
+        if (tracks.length > 0) {
+          fallbackUsed = true;
+
+          tracks = tracks.map(track => ({
+            ...track,
+            fallback: true,
+            qualityLabel:
+              `${track.qualityLabel} · Hi-Res unavailable`
+          }));
+        }
+      }
+
+    } else {
+      tracks = await collectTracks(docs, quality);
+    }
+
+    result = {
+      tracks,
+      fallbackUsed,
+      searchDocuments: docs.length,
+      sources: tracks.length ? ['Internet Archive'] : []
+    };
+  }
 
   searchCache.set(key, {
     at: Date.now(),
@@ -582,6 +756,32 @@ function decodeTrackId(raw) {
 }
 
 async function streamInfo(rawId, quality) {
+  if (rawId.startsWith('audius::')) {
+    const trackId = rawId.slice('audius::'.length);
+
+    if (!/^[a-zA-Z0-9_-]+$/.test(trackId)) {
+      return null;
+    }
+
+    // Audius documents this endpoint as its streamable MP3 route.
+    const streamUrl =
+      `https://api.audius.co/v1/tracks/${encodeURIComponent(trackId)}/stream`;
+
+    return {
+      url: streamUrl,
+      format: 'mp3',
+      quality: 'Audius stream · MP3 320 kbps / 48 kHz',
+      codec: 'mp3',
+      container: 'mp3',
+      manifest: 'none',
+      encrypted: false,
+      sampleRate: 48000,
+      bitRate: 320000,
+      bitDepth: null,
+      source: 'Audius'
+    };
+  }
+
   const parsed = decodeTrackId(rawId);
 
   if (!parsed) return null;
@@ -609,6 +809,10 @@ async function streamInfo(rawId, quality) {
     allowed = true;
   }
 
+  if (quality === 'best') {
+    allowed = isVerifiedLossless(info);
+  }
+
   if (!allowed) return null;
 
   const isFallback =
@@ -624,12 +828,14 @@ async function streamInfo(rawId, quality) {
     manifest: 'none',
     encrypted: false,
     sampleRate: info.sampleRate,
-    bitDepth: info.bitDepth
+    bitDepth: info.bitDepth,
+    source: 'Internet Archive'
   };
 }
 
 function validQuality(quality) {
   return [
+    'best',
     'hires',
     '24bit',
     'lossless'
@@ -671,7 +877,8 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok: true,
         addon: manifest.id,
-        version: manifest.version
+        version: manifest.version,
+        sources: ['Audius', 'Internet Archive']
       });
     }
 
@@ -681,20 +888,22 @@ const server = http.createServer(async (req, res) => {
       ).trim();
 
       const quality = (
-        url.searchParams.get('quality') || '24bit'
+        url.searchParams.get('quality') || 'best'
       ).toLowerCase();
 
       if (query.length < 2) {
         return send(res, 200, {
           tracks: [],
-          fallbackUsed: false
+          fallbackUsed: false,
+          sources: []
         });
       }
 
       if (quality === 'high') {
         return send(res, 200, {
           tracks: [],
-          fallbackUsed: false
+          fallbackUsed: false,
+          sources: []
         });
       }
 
@@ -725,7 +934,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const quality = (
-        url.searchParams.get('quality') || '24bit'
+        url.searchParams.get('quality') || 'best'
       ).toLowerCase();
 
       if (!validQuality(quality)) {
@@ -739,7 +948,7 @@ const server = http.createServer(async (req, res) => {
       return info
         ? send(res, 200, info)
         : send(res, 404, {
-            error: 'No verified FLAC file matching the selected quality was found.'
+            error: 'No verified audio file matching the selected quality was found.'
           });
     }
 
@@ -751,13 +960,13 @@ const server = http.createServer(async (req, res) => {
     console.error('Request error:', error);
 
     return send(res, 502, {
-      error: 'Catalogue temporarily unavailable. Please retry.'
+      error: 'Music catalogue temporarily unavailable. Please retry.'
     });
   }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(
-    `BitChord Public Hi-Res FLAC v2.3.0 listening on ${PORT}`
+    `BitChord Multi-Source Music v${VERSION} listening on ${PORT}`
   );
 });
